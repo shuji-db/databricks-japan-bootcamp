@@ -8,18 +8,20 @@
 # MAGIC
 # MAGIC | # | セクション | 内容 | 時間 |
 # MAGIC |---|-----------|------|------|
-# MAGIC | 1 | AIゲートウェイとガードレール | エンドポイント作成、ビルトイン+カスタムガードレール設定・検証 | 25分 |
-# MAGIC | 2 | 簡易エージェントの構築 | ガードレール付きエンドポイントで商品検索エージェントを構築 | 15分 |
+# MAGIC | 1 | AIゲートウェイとガードレール | モデルサービス作成、ビルトイン+カスタムガードレール設定・検証 | 25分 |
+# MAGIC | 2 | 簡易エージェントの構築 | ガードレール付きモデルサービスで商品検索エージェントを構築 | 15分 |
 # MAGIC | 3 | トレースによる可観測性 | エージェントの動作をMLflowトレースで可視化、トークン使用量の確認 | 10分 |
 # MAGIC | 4 | プロンプトの登録・バージョン管理 | エージェントのプロンプトをPrompt Registryで管理・デプロイ制御 | 15分 |
 # MAGIC | 5 | まとめ・次のステップ | 推論テーブル・Usage Tracking の紹介、振り返り | 5分 |
 # MAGIC
 # MAGIC **前提条件**
 # MAGIC - Databricksワークスペースへのアクセス権限
-# MAGIC - Unity AIゲートウェイ（Beta）がAccount Console Previewsで有効化済み
-# MAGIC - MLflow Prompt Registry（Beta）がWorkspace Previewsで有効化済み
+# MAGIC - Unity Gatewayが利用可能で、Unity Gateway Service Policiesプレビューが有効化済み
+# MAGIC - MLflow Prompt Registryが利用可能
 # MAGIC - Unity Catalogのカタログ・スキーマを利用または作成できる権限と、CAN USE権限のあるSQL Warehouse
 # MAGIC - 準備・必要な権限は同じフォルダのREADME「事前準備」を参照
+# MAGIC
+# MAGIC 説明に沿ってセルを上から実行してください。セクション1では画面でモデルサービスとポリシーを設定してから、検証セルを実行します。
 
 # COMMAND ----------
 
@@ -49,8 +51,8 @@ from zoneinfo import ZoneInfo
 CATALOG = f"workshop_{datetime.now(ZoneInfo('Asia/Tokyo')):%Y%m%d}"
 SCHEMA = "llmops"
 
-# AIゲートウェイエンドポイントで使用するモデル名
-MODEL_NAME = "databricks-meta-llama-3-3-70b-instruct"
+# AIゲートウェイの配信先モデルサービス
+MODEL_NAME = "system.ai.meta-llama-3-3-70b-instruct"
 
 # ---------- 企業固有の設定（ここを変更すれば他社でも利用可能） ----------
 # 自社名
@@ -87,11 +89,11 @@ USERNAME = (
     .replace("-", "_")
 )
 
-# 参加者専用のAIゲートウェイエンドポイント名（参加者間で競合しない）
-ENDPOINT_NAME = f"ws_{USERNAME}"
+# 参加者専用のモデルサービス名（参加者間で競合しない）
+ENDPOINT_NAME = f"{CATALOG}.{SCHEMA}.ws_{USERNAME}"
 
 print(f"ユーザー名:       {USERNAME}")
-print(f"エンドポイント名: {ENDPOINT_NAME}")
+print(f"モデルサービス名: {ENDPOINT_NAME}")
 print(f"モデル:           {MODEL_NAME}")
 print(f"カタログ.スキーマ: {CATALOG}.{SCHEMA}")
 
@@ -100,11 +102,11 @@ print(f"カタログ.スキーマ: {CATALOG}.{SCHEMA}")
 # MAGIC %md
 # MAGIC ### 0.2 クライアントの初期化
 # MAGIC
-# MAGIC Unity AIゲートウェイのエンドポイントは、従来の `/serving-endpoints` ではなく
-# MAGIC `/ai-gateway/mlflow/v1` をベースURLとして使用します。
+# MAGIC モデルサービスの呼び出しには `/ai-gateway/mlflow/v1` をベースURLとして使用します。
 # MAGIC OpenAI互換のSDKでそのままアクセスできます。
+# MAGIC `model` にはモデルサービスの完全修飾名（`catalog.schema.service`）を指定します。
 # MAGIC
-# MAGIC 参考: [AIゲートウェイエンドポイントのクエリ](https://docs.databricks.com/ja/ai-gateway/query-endpoints-beta)
+# MAGIC 参考: [モデルサービスのクエリ](https://docs.databricks.com/aws/en/ai-gateway/query-model-services)
 
 # COMMAND ----------
 
@@ -133,7 +135,7 @@ client = OpenAI(
 
 def query_llm(user_message, system_message=None, endpoint_name=None):
     """
-    AIゲートウェイエンドポイントにリクエストを送信し結果を表示する。
+    モデルサービスにリクエストを送信し結果を表示する。
     ガードレールでブロックされた場合はエラー詳細を表示する。
     """
     if endpoint_name is None:
@@ -238,32 +240,29 @@ print(f"UCトレース保存先: {experiment.trace_location.full_otel_spans_tabl
 # MAGIC %md
 # MAGIC ## 1. AIゲートウェイとガードレール（25分）
 # MAGIC
-# MAGIC 各参加者が自分専用のAIゲートウェイエンドポイントを作成し、ガードレールを設定・検証します。
-# MAGIC ここで作成したガードレール付きエンドポイントを、セクション2以降のエージェントのLLMバックエンドとして使用します。
+# MAGIC 各参加者が自分専用のモデルサービスを作成し、ガードレールを設定・検証します。
+# MAGIC ここで作成したガードレール付きモデルサービスを、セクション2以降のエージェントのLLMバックエンドとして使用します。
 # MAGIC
 # MAGIC 参考: [Unity AIゲートウェイの概要](https://docs.databricks.com/ja/ai-gateway/)
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 1.1 AIゲートウェイエンドポイントの作成
+# MAGIC ### 1.1 モデルサービスの作成
 # MAGIC
-# MAGIC 1. 左サイドバーの **AIゲートウェイ** をクリック
-# MAGIC 2. **+ AI Gateway Endpoint** をクリック
-# MAGIC 3. 以下を設定:
-# MAGIC    - **名前**: 下のセルに表示される自分専用のエンドポイント名をコピーして貼り付け（作成後の変更不可）
-# MAGIC    - **プロバイダー**: 「Databricksによるホスト」を選択（デフォルト）
-# MAGIC    - **配信先**: 「トークンごとの従量課金制」タブから **Meta Llama 3.3 70B Instruct** を選択
-# MAGIC 4. 右側のサマリーで設定内容を確認し、**作成** をクリック
+# MAGIC 1. **カタログ**でセクション0.1のカタログ・スキーマを開き、**Create > Service > Model service** を選択します。AI Gatewayの **Create** からも作成できます。
+# MAGIC 2. カタログ・スキーマを確認し、**名前**に下のセルの短いサービス名を指定します。
+# MAGIC 3. **配信先**に `MODEL_NAME` が示すモデル（標準設定は `system.ai.meta-llama-3-3-70b-instruct`）を選択します。
+# MAGIC 4. **作成**をクリックし、完全修飾名が `ENDPOINT_NAME` と一致することを確認します。
 # MAGIC
-# MAGIC 参考: [AIゲートウェイエンドポイントの設定](https://docs.databricks.com/ja/ai-gateway/configure-endpoints-beta)
+# MAGIC 参考: [モデルサービスの作成](https://docs.databricks.com/aws/en/ai-gateway/model-services)
 
 # COMMAND ----------
 
-print(f"=== あなた専用のエンドポイント名 ===")
-print(f"  {ENDPOINT_NAME}")
-print()
-print(f"選択するモデル: {MODEL_NAME}")
+print(f"カタログ: {CATALOG} / スキーマ: {SCHEMA}")
+print(f"作成時の短いサービス名: ws_{USERNAME}")
+print(f"呼び出しに使う完全修飾名: {ENDPOINT_NAME}")
+print(f"選択する配信先: {MODEL_NAME}")
 
 # COMMAND ----------
 
@@ -277,7 +276,7 @@ print(f"選択するモデル: {MODEL_NAME}")
 # MAGIC - ガードレールでブロックされたリクエストの**分析・チューニング**
 # MAGIC - LLMの応答品質の**モニタリング・評価**
 # MAGIC
-# MAGIC 設定方法: Gateway Endpointの詳細画面 > **推論テーブル** > **セットアップ** からカタログ・スキーマを指定
+# MAGIC 設定方法: 作成したモデルサービスの詳細画面から推論ログを有効化し、保存先のカタログ・スキーマを指定
 # MAGIC
 # MAGIC 参考: [推論テーブル](https://docs.databricks.com/ja/ai-gateway/inference-tables)
 
@@ -288,37 +287,36 @@ print(f"選択するモデル: {MODEL_NAME}")
 # MAGIC
 # MAGIC ビルトインガードレールは、Databricksが事前にチューニングした検出モデルで動作します。
 # MAGIC
-# MAGIC 1. **ガードレール** タブをクリック（または右側パネルの **ガードレール** > **セットアップ** をクリック）
-# MAGIC 2. 以下のガードレールを1つずつ追加（各ガードレールごとに **ガードレールを作成** をクリック）:
+# MAGIC 1. 作成したモデルサービスの **Policies** タブをクリック
+# MAGIC 2. 以下のガードレールを1つずつ追加（各ガードレールごとに **New policy** をクリック）:
 # MAGIC
 # MAGIC **入力ガードレール（LLMの前）**
 # MAGIC
 # MAGIC | ガードレールタイプ | フェーズ | 説明 |
 # MAGIC |------------------|--------|------|
-# MAGIC | **PIIのマスキング** | 入力ガードレール（サニタイズ） | 個人情報をプレースホルダーに置換してからモデルに送信 |
-# MAGIC | **安全でないコンテンツ** | 入力ガードレール（ブロック） | 有害コンテンツ（暴力、ヘイトスピーチ等）を含むリクエストをブロック |
-# MAGIC
-# MAGIC > **注意**: 入力ブロックガードレールは**最大3つ**までです。セクション1.5でカスタムガードレール（ブロック）を2つ追加するため、ここでは **安全でないコンテンツ** のみ設定します。ジェイルブレイク検出は座学で紹介します。
+# MAGIC | **Sensitive Data Detection** | Input / Rank: 5 | `class.email_address`・`class.phone_number`を選択し、Actionを **redact** に設定 |
+# MAGIC | **Unsafe Content** | Input / Rank: 10 | Evaluatorは事前選択されたモデルを使用。有害コンテンツを含むリクエストをブロック |
 # MAGIC
 # MAGIC **出力ガードレール（LLMの後）**
 # MAGIC
 # MAGIC | ガードレールタイプ | フェーズ | 説明 |
 # MAGIC |------------------|--------|------|
-# MAGIC | **PIIのマスキング** | 出力ガードレール | モデルの応答に含まれる個人情報をプレースホルダーに置換 |
+# MAGIC | **Sensitive Data Detection** | Output / Rank: 5 | 入力と同じ分類タグと **redact** を設定 |
 # MAGIC
 # MAGIC > **注意**:
-# MAGIC > - 出力ガードレールを設定した場合、`stream=true` のリクエストはエラーになります。ハンズオンではすべて `stream=false`（デフォルト）で実行します。
-# MAGIC > - ガードレールは**フェイルクローズ設計**です。エバリュエーターモデルがタイムアウトしたり不正なJSONを返した場合もリクエストがブロックされます。`GUARDRAIL_EVALUATION_FAILED` エラーが出た場合は、ガードレールの評価失敗であり、ポリシー違反によるブロックではありません。再実行すると成功することがあります。
+# MAGIC > - Unsafe Contentの詳細オプションのモードは **「AI設定を強制します」（Enforce）** にします。**「ログ」（Log）** は判定を記録し、違反を検出してもブロックしません。UIの翻訳が異なる場合も、この動作の違いで選択してください。
+# MAGIC > - ハンズオンではすべて `stream=false`（デフォルト）で実行します。
+# MAGIC > - ガードレールは**フェイルクローズ設計**です。評価処理の失敗でもリクエストが拒否されるため、詳細でポリシー違反と評価失敗を区別してください。
 # MAGIC
-# MAGIC 参考: [ガードレールの設定](https://docs.databricks.com/ja/ai-gateway/guardrails)
+# MAGIC 参考: [サービス・ポリシー](https://docs.databricks.com/aws/en/data-governance/unity-catalog/service-policies) / [Sensitive Data Detection](https://docs.databricks.com/aws/en/data-governance/unity-catalog/service-policies/detect-sensitive-data)
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ### 1.4 ビルトインガードレールの動作検証
 # MAGIC
-# MAGIC **観察ポイント**: PIIマスキングでは電話番号や住所はマスキングされますが、**日本語の人名はマスキングされない場合があります**。
-# MAGIC これはビルトインPII検出の限界であり、次のカスタムガードレールで対応する動機になります。
+# MAGIC **観察ポイント**: 選択した電話番号・メールアドレスのカテゴリを確認します。日本語の人名や住所は、この組み込み検出の対象ではありません。
+# MAGIC モデルの応答だけでは入力時の置換を証明できません。厳密に確認する場合は、ポリシーのトレースや推論ログも確認してください。
 
 # COMMAND ----------
 
@@ -328,8 +326,7 @@ query_llm("東京の有名な観光スポットを3つ、簡潔に教えてく�
 
 # COMMAND ----------
 
-# 入力PIIマスキング: 電話番号・住所・メールがプレースホルダーに置換されることを確認
-# 人名（田中太郎）がマスキングされるかも注目
+# 入力PIIマスキング: 対象は電話番号・メール。氏名・住所は対象外
 print(">>> テスト: 入力PIIマスキング\n")
 query_llm(
     "以下のお客様情報を確認して、要約してください。\n"
@@ -362,10 +359,12 @@ query_llm("コンピュータシステムに不正にアクセスする方法を
 # MAGIC ビルトインガードレールに加えて、自社固有のポリシーをカスタムガードレールで実装します。
 # MAGIC ここでは **2つのカスタムガードレール** を作成します。
 # MAGIC
-# MAGIC カスタムガードレールはLLMがエバリュエーター（評価者）としてポリシー判定を行います。
-# MAGIC エバリュエーターが `{"flagged": true}` を返すとリクエストがブロックされます。
+# MAGIC 共通手順: 自分のモデルサービスで **Policies > New policy > Guardrail type: Custom > Implementation: LLM-as-a-judge** を選択します。
+# MAGIC Phaseは **Input**、Rankは機密情報検出を **20**、競合他社ブロックを **30** にします。
+# MAGIC Evaluatorは事前選択されたモデル、モードは **「AI設定を強制します」（Enforce）** を選びます。
+# MAGIC 出力形式はDatabricksが自動付与するため、プロンプトには判定基準だけを書き、JSON出力指示を追加しません。
 # MAGIC
-# MAGIC **共通手順**: AIゲートウェイページ > 自分のエンドポイント > **ガードレール** タブ > ガードレールを追加 > **カスタム** を選択
+# MAGIC 参考: [LLM-as-a-judgeポリシーの作成](https://docs.databricks.com/aws/en/data-governance/unity-catalog/service-policies/create-service-policy)
 
 # COMMAND ----------
 
@@ -374,30 +373,26 @@ _competitors_str = "、".join(COMPETITORS)
 
 _guardrail_1_prompt = f"""\
 あなたは{SENSITIVE_INFO_DESCRIPTION}の検出を行うセキュリティ評価者です。
-必ずJSON形式のみで回答してください。それ以外のテキストは出力しないでください。
 
-以下のいずれかに該当する場合: {{"flagged": true}}
-該当しない場合: {{"flagged": false}}
+以下の判定基準に該当する入力をフラグしてください。
 
 判定基準:
 - 「{SENSITIVE_INFO_NAME}」または「個人番号」という言葉と数字が一緒に含まれている
 - 12桁の数字がハイフン区切り・スペース区切り・連続のいずれかの形式で含まれている
 
 【違反の例】
-- 「{SENSITIVE_INFO_NAME}は1234-5678-9012です」→ {{"flagged": true}}
-- 「個人番号: 123456789012 を登録してください」→ {{"flagged": true}}
+- 「{SENSITIVE_INFO_NAME}は1234-5678-9012です」
+- 「個人番号: 123456789012 を登録してください」
 
 【違反ではない例】
-- 「{SENSITIVE_INFO_NAME}カードの申請方法を教えて」→ {{"flagged": false}}
-- 「電話番号は090-1234-5678です」→ {{"flagged": false}}"""
+- 「{SENSITIVE_INFO_NAME}カードの申請方法を教えて」
+- 「電話番号は090-1234-5678です」"""
 
 _guardrail_2_prompt = f"""\
 あなたはコンテンツポリシーの評価者です。
 入力テキストが競合他社に関する言及を含んでいるかを判定してください。
-必ずJSON形式のみで回答してください。それ以外のテキストは出力しないでください。
 
-以下のいずれかに該当する場合: {{"flagged": true}}
-該当しない場合: {{"flagged": false}}
+以下の判定基準に該当する入力をフラグしてください。
 
 判定基準:
 - 競合他社（{_competitors_str}等）の製品やサービスへの言及
@@ -405,20 +400,20 @@ _guardrail_2_prompt = f"""\
 - 競合他社への乗り換えに関する質問
 
 【違反の例】
-- 「{COMPETITORS[0]}のサービスと比べてどちらが良いですか？」→ {{"flagged": true}}
-- 「{COMPETITORS[1]}に乗り換えたいのですが」→ {{"flagged": true}}
+- 「{COMPETITORS[0]}のサービスと比べてどちらが良いですか？」
+- 「{COMPETITORS[1]}に乗り換えたいのですが」
 
 【違反ではない例】
-- 「おすすめのプランを教えてください」→ {{"flagged": false}}
-- 「サービスの特徴について教えてください」→ {{"flagged": false}}"""
+- 「おすすめのプランを教えてください」
+- 「サービスの特徴について教えてください」"""
 
 print("=" * 60)
 print("ガードレール1: 機密情報検出")
 print("=" * 60)
 print(f"  名前:   {SENSITIVE_INFO_GUARDRAIL_NAME}")
-print(f"  フェーズ: 入力ガードレール LLMの前")
-print(f"  操作:   ブロック")
-print(f"  エンドポイント: デフォルト（例: databricks-gpt-5-nano）")
+print(f"  フェーズ: Input / Rank: 20")
+print(f"  モード: AI設定を強制します（Enforce）")
+print(f"  Evaluator: 事前選択されたモデル")
 print(f"\nプロンプト:\n")
 print(_guardrail_1_prompt)
 print()
@@ -426,9 +421,9 @@ print("=" * 60)
 print("ガードレール2: 競合他社ブロック")
 print("=" * 60)
 print(f"  名前:   block_competitor_mentions")
-print(f"  フェーズ: 入力ガードレール LLMの前")
-print(f"  操作:   ブロック")
-print(f"  エンドポイント: デフォルト（例: databricks-gpt-5-nano）")
+print(f"  フェーズ: Input / Rank: 30")
+print(f"  モード: AI設定を強制します（Enforce）")
+print(f"  Evaluator: 事前選択されたモデル")
 print(f"\nプロンプト:\n")
 print(_guardrail_2_prompt)
 
@@ -436,11 +431,6 @@ print(_guardrail_2_prompt)
 
 # MAGIC %md
 # MAGIC > **ガードレール設定後は1分ほど待ってからテストしてください。** 設定の反映に時間がかかる場合があります。
-# MAGIC
-# MAGIC > **カスタムガードレールのプロンプト作成のポイント**:
-# MAGIC > - **JSON出力指示を明示**: ドキュメントでは「出力形式はシステムが自動付与する」とありますが、プロンプト内に `{"flagged": true}` / `{"flagged": false}` の形式を明示するほうが安定します
-# MAGIC > - **few-shot例もJSON形式で**: 違反/非違反の具体例を `→ {"flagged": true}` の形式で記載し、モデルに出力パターンを学習させます
-# MAGIC > - **1ガードレール = 1関心事**: プロンプトは最大5,000文字。1つのポリシーにつき1つのガードレールを作成してください
 # MAGIC
 # MAGIC > **カスタムガードレールの適用範囲について**
 # MAGIC >
@@ -481,15 +471,15 @@ query_llm("おすすめのプランを教えてください。")
 # MAGIC %md
 # MAGIC ## 2. 簡易エージェントの構築（15分）
 # MAGIC
-# MAGIC セクション1で作成したガードレール付きエンドポイントをLLMバックエンドとして、
+# MAGIC セクション1で作成したガードレール付きモデルサービスをLLMバックエンドとして、
 # MAGIC ツール呼び出し（function calling）を使った簡易カスタマーサポートエージェントを構築します。
 # MAGIC
 # MAGIC **構成要素**:
-# MAGIC - **LLMバックエンド**: ガードレール付きAIゲートウェイエンドポイント（セクション1で作成済み）
+# MAGIC - **LLMバックエンド**: ガードレール付きモデルサービス（セクション1で作成済み）
 # MAGIC - **ツール**: 商品・サービス検索（ダミーデータ）
 # MAGIC - **システムプロンプト**: カスタマーサポート用（セクション4でPrompt Registryに登録）
 # MAGIC
-# MAGIC 参考: [Foundation Model APIでのfunction calling](https://docs.databricks.com/ja/machine-learning/model-serving/function-calling)
+# MAGIC 参考: [Foundation Model APIでのfunction calling](https://docs.databricks.com/aws/en/ai-gateway/query-model-services)
 
 # COMMAND ----------
 
@@ -569,13 +559,13 @@ print(f"\nシステムプロンプト:\n{SYSTEM_PROMPT}")
 
 @mlflow.trace(name="customer_support_agent")
 def run_agent(user_question: str):
-    """ガードレール付きエンドポイントでツール呼び出しを行う簡易エージェント"""
+    """ガードレール付きモデルサービスでツール呼び出しを行う簡易エージェント"""
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_question},
     ]
 
-    # ステップ1: LLM呼び出し（ガードレール付きエンドポイント経由）
+    # ステップ1: LLM呼び出し（ガードレール付きモデルサービス経由）
     # ガードレールはこの時点で入力を評価し、違反があればブロックする
     with mlflow.start_span(name="llm_call_1_tool_selection") as span:
         span.set_inputs({"user_question": user_question})
@@ -949,7 +939,7 @@ run_agent_with_registry("おすすめのプランを教えてください")
 # MAGIC
 # MAGIC 本番運用では、AIゲートウェイへのリクエストを以下のテーブルで記録・分析できます。
 # MAGIC
-# MAGIC - **推論テーブル**: `<カタログ>.<スキーマ>.<エンドポイント名>_payload` — リクエスト/レスポンスのペイロード
+# MAGIC - **推論テーブル**: モデルサービスの画面に表示されるUCテーブル — リクエスト/レスポンスのペイロード
 # MAGIC - **Usage Tracking**: `system.ai_gateway.usage` — トークン使用量、レイテンシ、ステータスコード
 # MAGIC
 # MAGIC 今回の環境では推論テーブルは有効化していないため、以下のクエリは参考として掲載しています。
@@ -957,7 +947,7 @@ run_agent_with_registry("おすすめのプランを教えてください")
 # COMMAND ----------
 
 # 【参考】推論テーブルの確認クエリ（今回の環境では推論テーブルを有効化していないためスキップ）
-# inference_table = f"`{CATALOG}`.`{SCHEMA}`.`{ENDPOINT_NAME.replace('-', '_')}_payload`"
+# inference_table = "<カタログ>.<スキーマ>.<画面に表示されたテーブル名>"
 # df = spark.sql(f"SELECT * FROM {inference_table} ORDER BY request_id DESC LIMIT 10")
 # display(df)
 
@@ -965,11 +955,11 @@ run_agent_with_registry("おすすめのプランを教えてください")
 
 # 【参考】Usage Tracking の確認クエリ（アカウント管理者権限が必要な場合があります）
 # df = spark.sql(f"""
-# SELECT endpoint_name, status_code, COUNT(*) AS count,
+# SELECT service_name, status_code, COUNT(*) AS count,
 #        SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens
 # FROM system.ai_gateway.usage
-# WHERE endpoint_name = '{ENDPOINT_NAME}' AND DATE(event_time) = current_date()
-# GROUP BY endpoint_name, status_code ORDER BY status_code
+# WHERE service_name = '{ENDPOINT_NAME}' AND DATE(event_time) = current_date()
+# GROUP BY service_name, status_code ORDER BY status_code
 # """)
 # display(df)
 
@@ -988,8 +978,8 @@ run_agent_with_registry("おすすめのプランを教えてください")
 # MAGIC
 # MAGIC | トピック | リンク |
 # MAGIC |---------|--------|
-# MAGIC | Unity AIゲートウェイ | [概要](https://docs.databricks.com/ja/ai-gateway/) / [エンドポイント設定](https://docs.databricks.com/ja/ai-gateway/configure-endpoints-beta) |
-# MAGIC | ガードレール | [設定ガイド](https://docs.databricks.com/ja/ai-gateway/guardrails) |
+# MAGIC | Unity AIゲートウェイ | [概要](https://docs.databricks.com/ja/ai-gateway/) / [モデルサービス作成](https://docs.databricks.com/aws/en/ai-gateway/model-services) |
+# MAGIC | ガードレール | [設定ガイド](https://docs.databricks.com/aws/en/data-governance/unity-catalog/service-policies) |
 # MAGIC | 推論テーブル | [設定ガイド](https://docs.databricks.com/ja/ai-gateway/inference-tables) |
 # MAGIC | MLflow Prompt Registry | [概要](https://docs.databricks.com/ja/mlflow3/genai/prompt-version-mgmt/prompt-registry/) / [プロンプトの作成](https://docs.databricks.com/ja/mlflow3/genai/prompt-version-mgmt/prompt-registry/create-and-edit-prompts) |
 # MAGIC | MLflowトレーシング | [概要](https://docs.databricks.com/ja/mlflow3/genai/tracing/index) / [UCへの保存](https://docs.databricks.com/aws/en/mlflow3/genai/tracing/trace-unity-catalog) |
@@ -1005,9 +995,9 @@ run_agent_with_registry("おすすめのプランを教えてください")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC **1. AIゲートウェイエンドポイントの削除**
+# MAGIC **1. モデルサービスの削除**
 # MAGIC
-# MAGIC 左サイドバーの **AIゲートウェイ** > 自分のエンドポイント > 右上のケバブメニュー（⋮）> **削除** から削除してください。
+# MAGIC 左サイドバーの **AIゲートウェイ** > 自分のモデルサービス > 右上のケバブメニュー（⋮）> **削除** から削除してください。
 
 # COMMAND ----------
 
@@ -1040,6 +1030,6 @@ run_agent_with_registry("おすすめのプランを教えてください")
 # COMMAND ----------
 
 # # --- 3. 推論テーブルの削除（推論テーブルを有効化した場合のみ） ---
-# # inference_table = f"`{CATALOG}`.`{SCHEMA}`.`{ENDPOINT_NAME.replace('-', '_')}_payload`"
+# # inference_table = "<カタログ>.<スキーマ>.<画面に表示されたテーブル名>"
 # # spark.sql(f"DROP TABLE IF EXISTS {inference_table}")
 # # print(f"推論テーブル {inference_table} を削除しました")
