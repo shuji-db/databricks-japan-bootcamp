@@ -15,6 +15,7 @@ Databricks上で**AIガードレール**と**プロンプト管理**を実装す
 - Databricksワークスペースへのアクセス権限
 - Unity AIゲートウェイ(Beta)がAccount Console Previewsで有効化済み
 - MLflow Prompt Registry(Beta)がWorkspace Previewsで有効化済み
+- Unity Catalogのカタログ・スキーマを利用または作成できる権限と、CAN USE権限のあるSQL Warehouse
 
 プレビュー機能の有効化・カタログ作成・権限設定の詳細な手順は、後述の「事前準備」を参照してください。
 
@@ -76,7 +77,8 @@ SENSITIVE_INFO_GUARDRAIL_NAME = "block_my_number"
 
 # 事前準備
 
-ワークショップ当日までに、管理者側で以下の準備を実施してください。
+各参加者が自分のDatabricksワークスペースで以下を準備してください。既存のカタログ・スキーマとSQL Warehouseを使える場合は、新規作成不要です。
+作成・権限変更ができない場合は、その環境の管理者に依頼してください。
 
 ## プレビュー機能の有効化
 
@@ -92,18 +94,21 @@ SENSITIVE_INFO_GUARDRAIL_NAME = "block_my_number"
 
 ## カタログ・スキーマの作成と権限設定
 
-ハンズオンではUnity Catalogのカタログ・スキーマを使用します。以下のSQLをDatabricks SQLエディタまたはノートブックで実行してください。カタログ・スキーマ名を変更する場合は、ノートブックの設定変数(セクション0.1の`CATALOG`、`SCHEMA`)も合わせて修正してください。
+ハンズオンではUnity Catalogのカタログ・スキーマを使用します。セクション0.1の `CATALOG`・`SCHEMA` に利用する名前を指定すると、セクション0.3で未作成の保存先を作成します。作成権限や管理ストレージの設定が不足する場合は、自分の環境の管理者に準備を依頼するか、利用可能な保存先を指定してください。
 
-**カタログ・スキーマの作成**
+以下のSQL例の `workshop`・`llmops` は、セクション0.1の `CATALOG`・`SCHEMA` の値に置き換えてください。
+
+**管理者が事前に作成する場合の例（Notebook内で作成できる場合は不要）**
 
 ```sql
 CREATE CATALOG IF NOT EXISTS workshop;
 CREATE SCHEMA IF NOT EXISTS workshop.llmops;
 ```
 
-**参加者への権限付与**
+**権限が不足する場合のみ**
 
-`<参加者グループ>`は実際のグループ名に置き換えてください(例: workshop_participants)。
+自分で作成したカタログ・スキーマは所有者として利用できるため、自分への追加付与は不要です。
+権限が不足する場合は、自分の環境の管理者に以下の権限付与を依頼してください。`<参加者グループ>`は実際のグループ名に置き換えます(例: workshop_participants)。
 
 ```sql
 -- カタログ・スキーマへのアクセス
@@ -114,7 +119,7 @@ GRANT USE SCHEMA ON SCHEMA workshop.llmops TO `<参加者グループ>`;
 GRANT CREATE FUNCTION ON SCHEMA workshop.llmops TO `<参加者グループ>`;
 GRANT EXECUTE ON SCHEMA workshop.llmops TO `<参加者グループ>`;
 
--- 推論テーブル用(AIゲートウェイのペイロードログ保存先)
+-- UCトレース保存用（推論ログも有効化する場合は同じ権限を使用）
 GRANT CREATE TABLE ON SCHEMA workshop.llmops TO `<参加者グループ>`;
 ```
 
@@ -126,7 +131,19 @@ GRANT CREATE TABLE ON SCHEMA workshop.llmops TO `<参加者グループ>`;
 | USE SCHEMA | workshop.llmopsスキーマ | スキーマへのアクセス |
 | CREATE FUNCTION | workshop.llmopsスキーマ | Prompt Registry(プロンプト登録) |
 | EXECUTE | workshop.llmopsスキーマ | Prompt Registry(プロンプト読み込み) |
-| CREATE TABLE | workshop.llmopsスキーマ | 推論テーブル(ペイロードログ) |
+| CREATE TABLE | workshop.llmopsスキーマ | UCトレース・任意の推論ログの保存 |
+
+## UCトレース用SQL Warehouseと権限
+
+セクション0.3で、起動中のものを優先して **CAN USE** 権限のあるWarehouseを自動選択します。IDの入力は不要です。選択したWarehouse名とIDはセルの出力で確認できます。
+利用できるものがない場合は、**SQL Warehouses** で[作成](https://docs.databricks.com/aws/en/compute/sql-warehouse/create)してからセルを再実行してください。作成権限がない場合は、自分の環境の管理者に依頼します。
+
+Warehouseは停止中でもクエリ実行時に自動起動するため、事前起動は不要です。最初のトレース検索では起動待ちが発生することがあります。
+参考: [SQL Warehouseの自動起動](https://docs.databricks.com/aws/en/compute/sql-warehouse/#start-a-sql-warehouse) ／ [作成と権限設定](https://docs.databricks.com/aws/en/compute/sql-warehouse/create)
+
+UCトレースはMLflow 3.14以降が必要です。初期化時に、エクスペリメントIDを既定の接頭辞として`_otel_spans`・`_otel_logs`・`_otel_metrics`・`_otel_annotations`の4テーブルが作成されます。
+作成者以外の実行IDで書き込み・閲覧する場合は、各テーブルに **MODIFYとSELECTを明示的に付与**してください。`ALL PRIVILEGES`だけでは代用できません。
+参考: [Unity Catalogへのトレース保存](https://docs.databricks.com/aws/en/mlflow3/genai/tracing/trace-unity-catalog)
 
 ## 参加者のワークスペースアクセス
 
@@ -134,26 +151,30 @@ GRANT CREATE TABLE ON SCHEMA workshop.llmops TO `<参加者グループ>`;
 
 ## ノートブックの配布
 
-ハンズオン用ノートブック(LLMOps_ハンズオン.py)をDatabricksワークスペースにアップロードし、参加者がアクセスできる共有フォルダに配置するか、各自のホームディレクトリにコピーしてください。
+各参加者がハンズオン用ノートブック(LLMOps_ハンズオン_generic.py)を自分のDatabricksワークスペースにアップロードしてください。
 
 # 0. 環境セットアップ
 
 必要なライブラリをインストールします。
 
 ```python
-%pip install -U openai "mlflow[databricks]>=3.1.0" databricks-sdk
+%pip install -U openai "mlflow[databricks]>=3.14.0" databricks-sdk
 dbutils.library.restartPython()
 ```
 
 ## 0.1 設定変数
 
-ワークショップ全体で使用する変数を定義します。カタログ・スキーマ名、企業情報は環境に合わせて変更してください。
+各参加者が自分のワークスペースで使う `CATALOG`・`SCHEMA` を確認してください。カタログ名は実行日（日本時間）を付けた `workshop_YYYYMMDD` です。未作成の場合はセクション0.3で作成します。
+SQL Warehouseとエクスペリメント名は自動設定します。企業情報はサンプルのままでも実行できます。
 
 ```python
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 # ========== ワークショップ設定 ==========
 
 # カタログ・スキーマ(環境に合わせて変更してください)
-CATALOG = "workshop"
+CATALOG = f"workshop_{datetime.now(ZoneInfo('Asia/Tokyo')):%Y%m%d}"
 SCHEMA = "llmops"
 
 # AIゲートウェイエンドポイントで使用するモデル名
@@ -219,6 +240,8 @@ from openai import OpenAI
 import mlflow
 import json
 import textwrap
+import os
+from mlflow.entities.trace_location import UnityCatalog
 
 # ワークスペースのホスト名と認証トークンを取得
 _host = spark.conf.get("spark.databricks.workspaceUrl")
@@ -235,16 +258,6 @@ client = OpenAI(
     api_key=_token,
     base_url=f"https://{_host}/ai-gateway/mlflow/v1",
 )
-
-# MLflowトレーシングの有効化(以降のLLM呼び出し・@mlflow.traceデコレータがすべて記録される)
-_current_user = spark.sql("SELECT current_user()").first()[0]
-mlflow.set_experiment(f"/Users/{_current_user}/llmops_workshop")
-mlflow.set_registry_uri("databricks-uc")
-mlflow.tracing.enable()
-
-# OpenAIクライアントの自動計装(各LLM呼び出しのスパンにトークン使用量が自動記録される)
-mlflow.openai.autolog()
-
 
 def query_llm(user_message, system_message=None, endpoint_name=None):
     """
@@ -290,16 +303,63 @@ def query_llm(user_message, system_message=None, endpoint_name=None):
 print(f"OpenAI互換クライアントを初期化しました")
 ```
 
-## 0.3 カタログ・スキーマの確認
+## 0.3 保存先の準備とトレーシングの有効化
+
+次のセルで保存先を準備し、利用できるSQL Warehouseを自動選択します。停止中のWarehouseも自動起動するため、事前起動は不要です。
+エクスペリメント名はユーザーと保存先から自動で決まり、同じ設定で再実行した場合は同じエクスペリメントを使います。
+
+参考: [Unity Catalogへのトレース保存](https://docs.databricks.com/aws/en/mlflow3/genai/tracing/trace-unity-catalog)
 
 ```python
-# Prompt RegistryとInference Tablesで使用するカタログ・スキーマを設定
-spark.sql(f"USE CATALOG {CATALOG}")
-spark.sql(f"USE SCHEMA {SCHEMA}")
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.errors import PermissionDenied
+from databricks.sdk.service.sql import State
 
-result = spark.sql("SELECT current_catalog(), current_schema()").first()
-print(f"カタログ: {result[0]}")
-print(f"スキーマ: {result[1]}")
+# 指定したカタログ・スキーマを準備（作成済みならそのまま使用）
+try:
+    spark.sql(f"CREATE CATALOG IF NOT EXISTS `{CATALOG}`")
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{CATALOG}`.`{SCHEMA}`")
+    spark.sql(f"USE CATALOG `{CATALOG}`")
+    spark.sql(f"USE SCHEMA `{SCHEMA}`")
+except Exception as e:
+    raise RuntimeError(
+        f"保存先 '{CATALOG}.{SCHEMA}' を準備できません。作成・アクセス権限と管理ストレージ設定を確認するか、セクション0.1に利用可能な名前を設定してください（README「事前準備」参照）。"
+    ) from e
+
+# 起動中を優先し、SELECT 1の受付でWarehouseの利用権限を確認
+w = WorkspaceClient()
+warehouses = sorted(w.warehouses.list(), key=lambda wh: (wh.state != State.RUNNING, wh.id))
+for warehouse in warehouses:
+    if warehouse.state not in (State.RUNNING, State.STARTING, State.STOPPED):
+        continue
+    try:
+        w.statement_execution.execute_statement(
+            warehouse_id=warehouse.id, statement="SELECT 1", wait_timeout="0s",
+        )
+    except PermissionDenied:
+        continue
+    SQL_WAREHOUSE_ID = warehouse.id
+    break
+else:
+    raise RuntimeError(
+        "利用できるSQL Warehouseがありません。SQL Warehousesで作成するか、環境の管理者にCAN USE権限を依頼して、このセルを再実行してください。"
+    )
+
+_current_user = spark.sql("SELECT current_user()").first()[0]
+EXPERIMENT_NAME = f"/Users/{_current_user}/llmops_workshop_{CATALOG}.{SCHEMA}"
+os.environ["MLFLOW_TRACING_SQL_WAREHOUSE_ID"] = SQL_WAREHOUSE_ID
+mlflow.set_tracking_uri("databricks")
+mlflow.set_registry_uri("databricks-uc")
+experiment = mlflow.set_experiment(
+    experiment_name=EXPERIMENT_NAME,
+    trace_location=UnityCatalog(catalog_name=CATALOG, schema_name=SCHEMA),
+)
+mlflow.tracing.enable()
+mlflow.openai.autolog()
+
+print(f"SQL Warehouse: {warehouse.name} ({SQL_WAREHOUSE_ID})")
+print(f"エクスペリメント: {EXPERIMENT_NAME}")
+print(f"UCトレース保存先: {experiment.trace_location.full_otel_spans_table_name}")
 ```
 
 # 1. AIゲートウェイとガードレール(25分)
@@ -680,8 +740,8 @@ except Exception as e:
 トレース結果はMLflow UIで視覚的に確認できます。
 
 1. 左サイドバーの**エクスペリメント**をクリック
-2. **llmops_workshop**を開く
-3. **トレース**タブをクリック
+2. セクション0.3で表示された名前のエクスペリメントを開く
+3. **トレース**タブをクリック。Warehouseの選択を求められた場合は、セクション0.3に表示されたWarehouseを選びます。
 4. トレースを開くと、以下のスパン構造が確認できます:
    - `customer_support_agent` — エージェント全体
      - `llm_call_1_tool_selection` — 1回目のLLM呼び出し(ツール選択)
@@ -691,14 +751,15 @@ except Exception as e:
 
 ```python
 # ノートブック上でもトレース一覧を確認
-_exp = mlflow.get_experiment_by_name(f"/Users/{_current_user}/llmops_workshop")
+mlflow.flush_trace_async_logging()
+_exp = mlflow.get_experiment_by_name(EXPERIMENT_NAME)
 traces = mlflow.search_traces(locations=[_exp.experiment_id])
 display(traces[["trace_id", "state", "execution_duration", "request_time"]])
 ```
 
 ## 3.2 トレースでのトークン使用量の確認
 
-MLflow Traceではトークン使用量(入力・出力トークン数)も自動記録されます。これはセクション0.2で設定した`mlflow.openai.autolog()`によるもので、OpenAIクライアント経由のLLM呼び出しごとにトークン数がスパンに記録されます。
+MLflow Traceではトークン使用量(入力・出力トークン数)も自動記録されます。これはセクション0.3で設定した`mlflow.openai.autolog()`によるもので、OpenAIクライアント経由のLLM呼び出しごとにトークン数がスパンに記録されます。
 
 参考: [Token Usage and Cost Tracking](https://mlflow.org/docs/latest/genai/tracing/token-usage-cost/)
 
@@ -706,7 +767,7 @@ MLflow Traceではトークン使用量(入力・出力トークン数)も自動
 # MLflow Traceに記録されたトークン使用量を確認
 print(">>> 直近のトレースのトークン使用量\n")
 
-_exp = mlflow.get_experiment_by_name(f"/Users/{_current_user}/llmops_workshop")
+_exp = mlflow.get_experiment_by_name(EXPERIMENT_NAME)
 recent_traces = mlflow.search_traces(locations=[_exp.experiment_id], max_results=5)
 
 for _, row in recent_traces.iterrows():
@@ -773,12 +834,12 @@ print(f"\nUIでの表示名: {USERNAME}_customer_support")
 登録したプロンプトはMLflowエクスペリメントUIから確認できます。
 
 1. 左サイドバーの**エクスペリメント**をクリック
-2. **llmops_workshop**を開く
+2. セクション0.3で表示された名前のエクスペリメントを開く
 3. 左パネルの**プロンプトとバージョン** > **プロンプト**をクリック
 4. 右上の**スキーマを選択**をクリック
-5. 「アセットを選択」ダイアログで**workshop** > **llmops**を選択し、**確認**をクリック
+5. 「アセットを選択」ダイアログで `CATALOG` > `SCHEMA` に指定した保存先を選択し、**確認** をクリック
 6. 自分のプロンプト(**あなたのユーザー名_customer_support**)をクリックして詳細ビューを開く
-   - 同じスキーマに全参加者のプロンプトが表示されます。プロンプト名の先頭にユーザー名が付いているので、自分のものを探してください
+   - プロンプト名の先頭にユーザー名が付いているので、自分のものを探してください
 7. 確認できる情報:
    - **プレビュー**: テンプレート内容とテンプレート変数(`{{company_name}}`等)
    - **比較**: 複数バージョンを並べて差分を確認
@@ -953,7 +1014,7 @@ run_agent_with_registry("おすすめのプランを教えてください")
 | ガードレール | [設定ガイド](https://docs.databricks.com/ja/ai-gateway/guardrails) |
 | 推論テーブル | [設定ガイド](https://docs.databricks.com/ja/ai-gateway/inference-tables) |
 | MLflow Prompt Registry | [概要](https://docs.databricks.com/ja/mlflow3/genai/prompt-version-mgmt/prompt-registry/) / [プロンプトの作成](https://docs.databricks.com/ja/mlflow3/genai/prompt-version-mgmt/prompt-registry/create-and-edit-prompts) |
-| MLflowトレーシング | [概要](https://docs.databricks.com/ja/mlflow3/genai/tracing/index) |
+| MLflowトレーシング | [概要](https://docs.databricks.com/ja/mlflow3/genai/tracing/index) / [UCへの保存](https://docs.databricks.com/aws/en/mlflow3/genai/tracing/trace-unity-catalog) |
 | Agent Framework | [エージェント構築](https://docs.databricks.com/ja/generative-ai/agent-framework/build-genai-apps.html) |
 
 # 6. クリーンアップ(任意)

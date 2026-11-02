@@ -18,6 +18,8 @@
 # MAGIC - Databricksワークスペースへのアクセス権限
 # MAGIC - Unity AIゲートウェイ（Beta）がAccount Console Previewsで有効化済み
 # MAGIC - MLflow Prompt Registry（Beta）がWorkspace Previewsで有効化済み
+# MAGIC - Unity Catalogのカタログ・スキーマを利用または作成できる権限と、CAN USE権限のあるSQL Warehouse
+# MAGIC - 準備・必要な権限は同じフォルダのREADME「事前準備」を参照
 
 # COMMAND ----------
 
@@ -26,7 +28,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install -U openai "mlflow[databricks]>=3.1.0" databricks-sdk
+# MAGIC %pip install -U openai "mlflow[databricks]>=3.14.0" databricks-sdk
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -34,14 +36,17 @@
 # MAGIC %md
 # MAGIC ### 0.1 設定変数
 # MAGIC
-# MAGIC ワークショップ全体で使用する変数を定義します。
-# MAGIC カタログ・スキーマ名、企業情報は環境に合わせて変更してください。
+# MAGIC 各参加者が自分のワークスペースで使う `CATALOG`・`SCHEMA` を確認してください。カタログ名は実行日（日本時間）を付けた `workshop_YYYYMMDD` です。未作成の場合はセクション0.3で作成します。
+# MAGIC SQL Warehouseとエクスペリメント名は自動設定します。企業情報はサンプルのままでも実行できます。
 
 # COMMAND ----------
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 # ========== ワークショップ設定 ==========
 # カタログ・スキーマ（環境に合わせて変更してください）
-CATALOG = "workshop"
+CATALOG = f"workshop_{datetime.now(ZoneInfo('Asia/Tokyo')):%Y%m%d}"
 SCHEMA = "llmops"
 
 # AIゲートウェイエンドポイントで使用するモデル名
@@ -107,6 +112,8 @@ from openai import OpenAI
 import mlflow
 import json
 import textwrap
+import os
+from mlflow.entities.trace_location import UnityCatalog
 
 # ワークスペースのホスト名と認証トークンを取得
 _host = spark.conf.get("spark.databricks.workspaceUrl")
@@ -123,16 +130,6 @@ client = OpenAI(
     api_key=_token,
     base_url=f"https://{_host}/ai-gateway/mlflow/v1",
 )
-
-# MLflowトレーシングの有効化（以降のLLM呼び出し・@mlflow.traceデコレータがすべて記録される）
-_current_user = spark.sql("SELECT current_user()").first()[0]
-mlflow.set_experiment(f"/Users/{_current_user}/llmops_workshop")
-mlflow.set_registry_uri("databricks-uc")
-mlflow.tracing.enable()
-
-# OpenAIクライアントの自動計装（各LLM呼び出しのスパンにトークン使用量が自動記録される）
-mlflow.openai.autolog()
-
 
 def query_llm(user_message, system_message=None, endpoint_name=None):
     """
@@ -177,16 +174,64 @@ print(f"OpenAI互換クライアントを初期化しました")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 0.3 カタログ・スキーマの確認
+# MAGIC ### 0.3 保存先の準備とトレーシングの有効化
+# MAGIC
+# MAGIC 次のセルで保存先を準備し、利用できるSQL Warehouseを自動選択します。停止中のWarehouseも自動起動するため、事前起動は不要です。
+# MAGIC エクスペリメント名はユーザーと保存先から自動で決まり、同じ設定で再実行した場合は同じエクスペリメントを使います。
+# MAGIC
+# MAGIC 参考: [Unity Catalogへのトレース保存](https://docs.databricks.com/aws/en/mlflow3/genai/tracing/trace-unity-catalog)
 
 # COMMAND ----------
 
-# Prompt RegistryとInference Tablesで使用するカタログ・スキーマを設定
-spark.sql(f"USE CATALOG {CATALOG}")
-spark.sql(f"USE SCHEMA {SCHEMA}")
-result = spark.sql("SELECT current_catalog(), current_schema()").first()
-print(f"カタログ: {result[0]}")
-print(f"スキーマ: {result[1]}")
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.errors import PermissionDenied
+from databricks.sdk.service.sql import State
+
+# 指定したカタログ・スキーマを準備（作成済みならそのまま使用）
+try:
+    spark.sql(f"CREATE CATALOG IF NOT EXISTS `{CATALOG}`")
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{CATALOG}`.`{SCHEMA}`")
+    spark.sql(f"USE CATALOG `{CATALOG}`")
+    spark.sql(f"USE SCHEMA `{SCHEMA}`")
+except Exception as e:
+    raise RuntimeError(
+        f"保存先 '{CATALOG}.{SCHEMA}' を準備できません。作成・アクセス権限と管理ストレージ設定を確認するか、セクション0.1に利用可能な名前を設定してください（README「事前準備」参照）。"
+    ) from e
+
+# 起動中を優先し、SELECT 1の受付でWarehouseの利用権限を確認
+w = WorkspaceClient()
+warehouses = sorted(w.warehouses.list(), key=lambda wh: (wh.state != State.RUNNING, wh.id))
+for warehouse in warehouses:
+    if warehouse.state not in (State.RUNNING, State.STARTING, State.STOPPED):
+        continue
+    try:
+        w.statement_execution.execute_statement(
+            warehouse_id=warehouse.id, statement="SELECT 1", wait_timeout="0s",
+        )
+    except PermissionDenied:
+        continue
+    SQL_WAREHOUSE_ID = warehouse.id
+    break
+else:
+    raise RuntimeError(
+        "利用できるSQL Warehouseがありません。SQL Warehousesで作成するか、環境の管理者にCAN USE権限を依頼して、このセルを再実行してください。"
+    )
+
+_current_user = spark.sql("SELECT current_user()").first()[0]
+EXPERIMENT_NAME = f"/Users/{_current_user}/llmops_workshop_{CATALOG}.{SCHEMA}"
+os.environ["MLFLOW_TRACING_SQL_WAREHOUSE_ID"] = SQL_WAREHOUSE_ID
+mlflow.set_tracking_uri("databricks")
+mlflow.set_registry_uri("databricks-uc")
+experiment = mlflow.set_experiment(
+    experiment_name=EXPERIMENT_NAME,
+    trace_location=UnityCatalog(catalog_name=CATALOG, schema_name=SCHEMA),
+)
+mlflow.tracing.enable()
+mlflow.openai.autolog()
+
+print(f"SQL Warehouse: {warehouse.name} ({SQL_WAREHOUSE_ID})")
+print(f"エクスペリメント: {EXPERIMENT_NAME}")
+print(f"UCトレース保存先: {experiment.trace_location.full_otel_spans_table_name}")
 
 # COMMAND ----------
 
@@ -616,8 +661,8 @@ except Exception as e:
 # MAGIC トレース結果はMLflow UIで視覚的に確認できます。
 # MAGIC
 # MAGIC 1. 左サイドバーの **エクスペリメント** をクリック
-# MAGIC 2. **llmops_workshop** を開く
-# MAGIC 3. **トレース** タブをクリック
+# MAGIC 2. セクション0.3で表示された名前のエクスペリメントを開く
+# MAGIC 3. **トレース** タブをクリック。Warehouseの選択を求められた場合は、セクション0.3に表示されたWarehouseを選びます。
 # MAGIC 4. トレースを開くと、以下のスパン構造が確認できます:
 # MAGIC    - `customer_support_agent` — エージェント全体
 # MAGIC      - `llm_call_1_tool_selection` — 1回目のLLM呼び出し（ツール選択）
@@ -628,7 +673,8 @@ except Exception as e:
 # COMMAND ----------
 
 # ノートブック上でもトレース一覧を確認
-_exp = mlflow.get_experiment_by_name(f"/Users/{_current_user}/llmops_workshop")
+mlflow.flush_trace_async_logging()
+_exp = mlflow.get_experiment_by_name(EXPERIMENT_NAME)
 traces = mlflow.search_traces(locations=[_exp.experiment_id])
 display(traces[["trace_id", "state", "execution_duration", "request_time"]])
 
@@ -638,7 +684,7 @@ display(traces[["trace_id", "state", "execution_duration", "request_time"]])
 # MAGIC ### 3.2 トレースでのトークン使用量の確認
 # MAGIC
 # MAGIC MLflow Traceではトークン使用量（入力・出力トークン数）も自動記録されます。
-# MAGIC これはセクション0.2で設定した `mlflow.openai.autolog()` によるもので、OpenAIクライアント経由のLLM呼び出しごとにトークン数がスパンに記録されます。
+# MAGIC これはセクション0.3で設定した `mlflow.openai.autolog()` によるもので、OpenAIクライアント経由のLLM呼び出しごとにトークン数がスパンに記録されます。
 # MAGIC
 # MAGIC 参考: [Token Usage and Cost Tracking](https://mlflow.org/docs/latest/genai/tracing/token-usage-cost/)
 
@@ -646,7 +692,7 @@ display(traces[["trace_id", "state", "execution_duration", "request_time"]])
 
 # MLflow Traceに記録されたトークン使用量を確認
 print(">>> 直近のトレースのトークン使用量\n")
-_exp = mlflow.get_experiment_by_name(f"/Users/{_current_user}/llmops_workshop")
+_exp = mlflow.get_experiment_by_name(EXPERIMENT_NAME)
 recent_traces = mlflow.search_traces(locations=[_exp.experiment_id], max_results=5)
 
 for _, row in recent_traces.iterrows():
@@ -721,12 +767,12 @@ print(f"\nUIでの表示名: {USERNAME}_customer_support")
 # MAGIC 登録したプロンプトはMLflowエクスペリメントUIから確認できます。
 # MAGIC
 # MAGIC 1. 左サイドバーの **エクスペリメント** をクリック
-# MAGIC 2. **llmops_workshop** を開く
+# MAGIC 2. セクション0.3で表示された名前のエクスペリメントを開く
 # MAGIC 3. 左パネルの **プロンプトとバージョン** > **プロンプト** をクリック
 # MAGIC 4. 右上の **スキーマを選択** をクリック
-# MAGIC 5. 「アセットを選択」ダイアログで **workshop** > **llmops** を選択し、**確認** をクリック
+# MAGIC 5. 「アセットを選択」ダイアログで `CATALOG` > `SCHEMA` に指定した保存先を選択し、**確認** をクリック
 # MAGIC 6. 自分のプロンプト（ **あなたのユーザー名_customer_support** ）をクリックして詳細ビューを開く
-# MAGIC    - 同じスキーマに全参加者のプロンプトが表示されます。プロンプト名の先頭にユーザー名が付いているので、自分のものを探してください
+# MAGIC    - プロンプト名の先頭にユーザー名が付いているので、自分のものを探してください
 # MAGIC 7. 確認できる情報:
 # MAGIC    - **プレビュー**: テンプレート内容とテンプレート変数（`{{company_name}}` 等）
 # MAGIC    - **比較**: 複数バージョンを並べて差分を確認
@@ -946,7 +992,7 @@ run_agent_with_registry("おすすめのプランを教えてください")
 # MAGIC | ガードレール | [設定ガイド](https://docs.databricks.com/ja/ai-gateway/guardrails) |
 # MAGIC | 推論テーブル | [設定ガイド](https://docs.databricks.com/ja/ai-gateway/inference-tables) |
 # MAGIC | MLflow Prompt Registry | [概要](https://docs.databricks.com/ja/mlflow3/genai/prompt-version-mgmt/prompt-registry/) / [プロンプトの作成](https://docs.databricks.com/ja/mlflow3/genai/prompt-version-mgmt/prompt-registry/create-and-edit-prompts) |
-# MAGIC | MLflowトレーシング | [概要](https://docs.databricks.com/ja/mlflow3/genai/tracing/index) |
+# MAGIC | MLflowトレーシング | [概要](https://docs.databricks.com/ja/mlflow3/genai/tracing/index) / [UCへの保存](https://docs.databricks.com/aws/en/mlflow3/genai/tracing/trace-unity-catalog) |
 # MAGIC | Agent Framework | [エージェント構築](https://docs.databricks.com/ja/generative-ai/agent-framework/build-genai-apps.html) |
 
 # COMMAND ----------
