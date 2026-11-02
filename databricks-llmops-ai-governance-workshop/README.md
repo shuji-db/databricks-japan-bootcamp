@@ -276,6 +276,23 @@ client = OpenAI(
     base_url=f"https://{_host}/ai-gateway/mlflow/v1",
 )
 
+class WorkshopPolicyBlocked(RuntimeError):
+    """HTTP 200で返るサービス・ポリシーの拒否を、通常応答と区別する。"""
+
+    def __init__(self, policy):
+        self.body = policy
+        super().__init__(json.dumps(policy, ensure_ascii=False))
+
+
+def call_gateway(**kwargs):
+    """すべてのモデル呼び出しで、本文中のポリシー拒否も確認する。"""
+    response = client.chat.completions.create(**kwargs)
+    policy = response.model_dump(exclude_none=True).get("databricks_service_policy")
+    if policy is not None:
+        raise WorkshopPolicyBlocked(policy)
+    return response
+
+
 def query_llm(user_message, system_message=None, endpoint_name=None):
     """
     モデルサービスにリクエストを送信し結果を表示する。
@@ -290,7 +307,7 @@ def query_llm(user_message, system_message=None, endpoint_name=None):
     messages.append({"role": "user", "content": user_message})
 
     try:
-        response = client.chat.completions.create(
+        response = call_gateway(
             model=endpoint_name, messages=messages, max_tokens=500,
         )
         content = response.choices[0].message.content
@@ -302,7 +319,7 @@ def query_llm(user_message, system_message=None, endpoint_name=None):
         return response
     except Exception as e:
         error_msg = str(e)
-        if "blocked" in error_msg.lower() or "guardrail" in error_msg.lower():
+        if isinstance(e, WorkshopPolicyBlocked):
             print("[ブロック] ガードレールによりリクエストがブロックされました")
         else:
             print("[エラー] リクエストが失敗しました")
@@ -314,6 +331,8 @@ def query_llm(user_message, system_message=None, endpoint_name=None):
                 print(error_msg[:500])
         except Exception:
             print(error_msg[:500])
+        if not isinstance(e, WorkshopPolicyBlocked):
+            raise
         return None
 
 
@@ -558,6 +577,8 @@ print(_guardrail_2_prompt)
 
 > **ガードレール設定後は1分ほど待ってからテストしてください。** 設定の反映に時間がかかる場合があります。
 
+> ポリシーで拒否されてもHTTP 200が返ることがあります。`call_gateway()`は本文の`databricks_service_policy`を確認して後続処理を止め、通常のAPIエラーとは区別します。
+>
 > **カスタムガードレールの適用範囲について**
 >
 > カスタムガードレールはLLMが評価を行うため、**意味的な判定**(競合他社の言及、ポリシー違反の検出など)に適しています。一方、マイナンバーや口座番号のような**パターンベースの検出**はLLMの確率的な性質により精度が安定しないため、アプリケーション層での正規表現チェックなど、確定的な方法と組み合わせることを推奨します。
@@ -680,7 +701,7 @@ def run_agent(user_question: str):
     # ガードレールはこの時点で入力を評価し、違反があればブロックする
     with mlflow.start_span(name="llm_call_1_tool_selection") as span:
         span.set_inputs({"user_question": user_question})
-        response = client.chat.completions.create(
+        response = call_gateway(
             model=ENDPOINT_NAME, messages=messages, tools=tools, max_tokens=500,
         )
         assistant_msg = response.choices[0].message
@@ -705,7 +726,7 @@ def run_agent(user_question: str):
         # ステップ3: ツール結果を踏まえた最終回答を生成
         with mlflow.start_span(name="llm_call_2_final_answer") as span:
             span.set_inputs({"tool_results": result})
-            response = client.chat.completions.create(
+            response = call_gateway(
                 model=ENDPOINT_NAME, messages=messages, max_tokens=500,
             )
             assistant_msg = response.choices[0].message
@@ -728,11 +749,11 @@ run_agent("おすすめのプランを教えてください")
 ```
 
 ```python
-# ガードレールによるブロック: 機密情報を含むリクエストはエージェントに到達する前にブロック
+# ガードレールによるブロック: 最初のモデル呼び出しで拒否され、商品検索を実行しない
 print(f">>> エージェント: {SENSITIVE_INFO_NAME}を含む問い合わせ(ブロックされるべき)\n")
 try:
     run_agent(f"{SENSITIVE_INFO_NAME}1234-5678-9012で本人確認をお願いします")
-except Exception as e:
+except WorkshopPolicyBlocked as e:
     print(f"[ブロック] ガードレールによりエージェント実行がブロックされました")
     if hasattr(e, "body"):
         print(json.dumps(e.body, indent=2, ensure_ascii=False))
@@ -934,7 +955,7 @@ def run_agent_with_registry(user_question: str, alias: str = "production"):
         {"role": "user", "content": user_question},
     ]
 
-    response = client.chat.completions.create(
+    response = call_gateway(
         model=ENDPOINT_NAME, messages=messages, tools=tools, max_tokens=500,
     )
     assistant_msg = response.choices[0].message
@@ -947,7 +968,7 @@ def run_agent_with_registry(user_question: str, alias: str = "production"):
             print(f"[ツール呼び出し] search_products(keyword='{args.get('keyword', '')}')")
             messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
 
-        response = client.chat.completions.create(
+        response = call_gateway(
             model=ENDPOINT_NAME, messages=messages, max_tokens=500,
         )
         assistant_msg = response.choices[0].message
